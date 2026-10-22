@@ -10,7 +10,8 @@ What changed:
 - Bug fix: the padding of the CTC audio input is now written as zeros. Upstream assumes `MLMultiArray` memory is zero-initialized, but it is not, so a reused allocation can leave old audio in the padding and make log-probs nondeterministic.
 - `CtcModels.load` has a `computeUnits:` parameter (default `.cpuAndNeuralEngine`, unchanged), so an app can load CPU copies first while the Neural Engine models compile.
 - Bug fix: the CTC `MelSpectrogram` always runs on the CPU, like the Parakeet preprocessor; the compute units apply to the encoder only. On the Neural Engine the mel model returns near-zero features (98.8% zeros, seen on macOS 27.2 on an M1 Pro, also with upstream `762baf6`), so the encoder hears silence, blank wins every frame and keyword spotting and rescoring lose their acoustic evidence. `.cpuOnly`, `.cpuAndGPU` and `.all` return correct features.
-- 3 tests in `CtcInferenceBufferTests` check that the bulk copies match subscript access for Float16 and Float32, contiguous and padded layouts. `CtcModelsComputeUnitsTests` checks that a default load hears speech like a CPU-only load (skipped without cached CTC models).
+- The rescorer also scores the matched alias's own tokens, not only the term's spelling. A spoken-form alias like "cube control" for `kubectl` sounds unlike the spelling, so with correct acoustics the transcript's identical phrase always beat the term. In a dictation app's eval (960 synthetic tech sentences) this took the mel fix from 848 to 853 passing cases and kept "context seven" → `context7`.
+- 3 tests in `CtcInferenceBufferTests` check that the bulk copies match subscript access for Float16 and Float32, contiguous and padded layouts. `CtcModelsComputeUnitsTests` checks that a default load hears speech like a CPU-only load, and `VocabularyRescorerAliasScoringTests` that an alias heard in the audio wins for its term (both skipped without cached CTC models).
 
 What to keep checking upstream:
 
@@ -18,6 +19,7 @@ What to keep checking upstream:
 - Changes to `CtcKeywordSpotter+Inference.swift` (`makeLogProbs`, `prepareAudioArray`), `CtcModels.swift` and the `CustomVocabulary` rescorer, which would conflict or change the output.
 - Model and version bumps: Parakeet TDT v2/v3, the CTC model variants (`CtcModelVariant`) and their output shapes.
 - Whether upstream pins the CTC `MelSpectrogram` to the CPU (`CtcModels.load` and `loadDirect`), or a new CTC model or macOS release makes the mel correct on the Neural Engine. Check with `CtcModelsComputeUnitsTests`, which fails when the default load hears silence.
+- Changes to how the rescorer scores aliases (`evaluateCTCMatch` in `VocabularyRescorer+TokenEvaluation.swift`). If upstream scores alias tokens too, drop that part of the fork.
 - CoreML loading API changes. If `CtcModels.load` gets a `configuration:` parameter like `AsrModels.load` has, use it and drop the fork's `computeUnits:`.
 
 To update, fetch upstream and rebase: `git fetch origin && git rebase origin/main`, then run `swift test`. If upstream merges equivalent changes, switch back to the upstream package.
