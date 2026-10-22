@@ -255,9 +255,12 @@ extension CtcKeywordSpotter {
             array = try MLMultiArray(shape: [NSNumber(value: maxModelSamples)], dataType: dataType)
         }
 
-        // Copy actual samples (MLMultiArray is zero-initialized, so padding is implicit).
-        for i in 0..<clampedCount {
-            array[i] = NSNumber(value: audioSamples[i])
+        // MLMultiArray memory is not guaranteed to be zeroed (reused allocations keep old data),
+        // so the padding is written explicitly.
+        if !Self.fillContiguousAudio(array, with: audioSamples, count: clampedCount) {
+            for i in 0..<array.count {
+                array[i] = NSNumber(value: i < clampedCount ? audioSamples[i] : 0)
+            }
         }
 
         if debugMode {
@@ -276,6 +279,38 @@ extension CtcKeywordSpotter {
         }
 
         return (array, clampedCount)
+    }
+
+    /// Copy `count` samples into a freshly allocated contiguous Float16/Float32 array and zero the rest.
+    ///
+    /// Returns `false` without writing when the array is not densely packed or has another data type.
+    static func fillContiguousAudio(_ array: MLMultiArray, with samples: [Float], count: Int) -> Bool {
+        guard array.dataType == .float16 || array.dataType == .float32, count > 0, count <= samples.count,
+            count <= array.count
+        else { return false }
+
+        let shape = array.shape.map { $0.intValue }
+        return array.withUnsafeMutableBytes { buffer, strides in
+            var expectedStride = 1
+            for axis in shape.indices.reversed() where shape[axis] > 1 {
+                guard strides[axis] == expectedStride else { return false }
+                expectedStride *= shape[axis]
+            }
+            guard let base = buffer.baseAddress else { return false }
+
+            samples.withUnsafeBufferPointer { source in
+                if array.dataType == .float16 {
+                    let destination = base.assumingMemoryBound(to: UInt16.self)
+                    Float16Conversion.fromFloat32(src: source.baseAddress!, dst: destination, count: count)
+                    (destination + count).update(repeating: 0, count: array.count - count)
+                } else {
+                    let destination = base.assumingMemoryBound(to: Float.self)
+                    destination.update(from: source.baseAddress!, count: count)
+                    (destination + count).update(repeating: 0, count: array.count - count)
+                }
+            }
+            return true
+        }
     }
 
     private func makeAudioFeatureProvider(array: MLMultiArray, length: Int) throws -> MLFeatureProvider {
