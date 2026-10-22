@@ -74,6 +74,24 @@ extension VocabularyRescorer {
             }
         }
 
+        // A spoken-form alias ("cube control" for "kubectl") can sound unlike the term's
+        // spelling, so the alias's own tokens count as acoustic evidence for the term too.
+        if let tokenizer = ctcTokenizer, let alias = candidate.matchedAlias {
+            for aliasTokens in [tokenizer.encode(alias), tokenizer.encodeWithoutBoundary(alias)]
+            where !aliasTokens.isEmpty {
+                let (aliasScore, _, _) = spotter.ctcWordSpotConstrained(
+                    logProbs: logProbs,
+                    keywordTokens: aliasTokens,
+                    searchStartFrame: searchStart,
+                    searchEndFrame: searchEnd
+                )
+                if aliasScore > vocabCtcScore {
+                    vocabCtcScore = aliasScore
+                    vocabTokensUsed = aliasTokens
+                }
+            }
+        }
+
         // Score original phrase using constrained CTC
         guard let tokenizer = ctcTokenizer else {
             debugLog("  [WARN] No tokenizer - skipping CTC comparison for '\(candidate.originalPhrase)'")
