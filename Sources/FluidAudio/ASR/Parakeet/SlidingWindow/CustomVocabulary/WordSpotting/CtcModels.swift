@@ -77,6 +77,7 @@ extension CtcModels {
         logger.info("Loading CTC models directly from: \(directory.path)")
 
         let config = defaultConfiguration()
+        let melConfig = MLModelConfigurationUtils.defaultConfiguration(computeUnits: preprocessorComputeUnits)
 
         // Load MelSpectrogram model
         let melPath = directory.appendingPathComponent("MelSpectrogram.mlmodelc")
@@ -87,12 +88,12 @@ extension CtcModels {
         // Try loading directly first (for pre-compiled models), then try compiling
         let melModel: MLModel
         do {
-            melModel = try MLModel(contentsOf: melPath, configuration: config)
+            melModel = try MLModel(contentsOf: melPath, configuration: melConfig)
             logger.info("Loaded MelSpectrogram directly from: \(melPath.path)")
         } catch {
             logger.info("Direct load failed, attempting compilation...")
             let compiledMelURL = try await MLModel.compileModel(at: melPath)
-            melModel = try MLModel(contentsOf: compiledMelURL, configuration: config)
+            melModel = try MLModel(contentsOf: compiledMelURL, configuration: melConfig)
         }
 
         // Load AudioEncoder model
@@ -141,7 +142,7 @@ extension CtcModels {
     /// - Parameters:
     ///   - directory: Directory containing the downloaded CoreML bundles.
     ///   - variant: Which CTC model variant to load (default: .ctc110m).
-    ///   - computeUnits: Compute units for the models (default: `.cpuAndNeuralEngine`).
+    ///   - computeUnits: Compute units for the encoder (default: `.cpuAndNeuralEngine`). The MelSpectrogram always runs on the CPU.
     /// - Returns: Loaded `CtcModels` instance.
     public static func load(
         from directory: URL,
@@ -155,21 +156,22 @@ extension CtcModels {
 
         // ModelHub expects the base directory (without the repo folder) and
         // resolves the repo's folderName internally.
-        let modelNames = [
-            ModelNames.CTC.melSpectrogramPath,
-            ModelNames.CTC.audioEncoderPath,
-        ]
-
-        let models = try await ModelHub.loadModels(
+        let melModels = try await ModelHub.loadModels(
             variant.repo,
-            modelNames: modelNames,
+            modelNames: [ModelNames.CTC.melSpectrogramPath],
+            directory: parentDirectory,
+            computeUnits: preprocessorComputeUnits
+        )
+        let encoderModels = try await ModelHub.loadModels(
+            variant.repo,
+            modelNames: [ModelNames.CTC.audioEncoderPath],
             directory: parentDirectory,
             computeUnits: config.computeUnits
         )
 
         guard
-            let melModel = models[ModelNames.CTC.melSpectrogramPath],
-            let encoderModel = models[ModelNames.CTC.audioEncoderPath]
+            let melModel = melModels[ModelNames.CTC.melSpectrogramPath],
+            let encoderModel = encoderModels[ModelNames.CTC.audioEncoderPath]
         else {
             throw AsrModelsError.loadingFailed("Failed to load CTC MelSpectrogram or AudioEncoder models")
         }
@@ -247,6 +249,10 @@ extension CtcModels {
         let targetDir = try await download(to: directory, variant: variant)
         return try await load(from: targetDir, variant: variant)
     }
+
+    /// The MelSpectrogram runs on the CPU, like the Parakeet preprocessor. On the Neural Engine
+    /// it returns near-zero features (seen on macOS 27.2, M1 Pro), so the encoder hears silence.
+    static let preprocessorComputeUnits: MLComputeUnits = .cpuOnly
 
     /// Default CoreML configuration for CTC inference.
     public static func defaultConfiguration() -> MLModelConfiguration {
