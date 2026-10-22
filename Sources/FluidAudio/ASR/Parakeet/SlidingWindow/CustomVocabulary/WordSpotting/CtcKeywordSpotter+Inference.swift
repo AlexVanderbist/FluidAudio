@@ -1,3 +1,4 @@
+import Accelerate
 import CoreML
 import Foundation
 
@@ -392,41 +393,28 @@ extension CtcKeywordSpotter {
             throw ASRError.processingFailed("Unexpected CTC output rank: \(ctcOutput.shape)")
         }
 
-        let vocabSize: Int
-        let timeSteps: Int
-        let indexBuilder: (Int, Int) -> [NSNumber]
-
-        if rank == 3 {
-            // Expected shape: [1, timeSteps, vocabSize]
-            timeSteps = ctcOutput.shape[1].intValue
-            vocabSize = ctcOutput.shape[2].intValue
-            indexBuilder = { t, v in [0, t, v].map { NSNumber(value: $0) } }
-        } else {
-            // Expected shape: [1, vocabSize, 1, timeSteps]
-            vocabSize = ctcOutput.shape[1].intValue
-            timeSteps = ctcOutput.shape[3].intValue
-            indexBuilder = { t, v in [0, v, 0, t].map { NSNumber(value: $0) } }
-        }
+        // Expected shape: [1, timeSteps, vocabSize] (rank 3) or [1, vocabSize, 1, timeSteps] (rank 4)
+        let timeAxis = rank == 3 ? 1 : 3
+        let vocabAxis = rank == 3 ? 2 : 1
+        let timeSteps = ctcOutput.shape[timeAxis].intValue
+        let vocabSize = ctcOutput.shape[vocabAxis].intValue
 
         if vocabSize <= 0 || timeSteps <= 0 {
             return []
         }
+
+        let logits =
+            Self.frameMajorLogits(from: ctcOutput, timeAxis: timeAxis, vocabAxis: vocabAxis)
+            ?? Self.frameMajorLogitsBySubscript(from: ctcOutput, timeAxis: timeAxis, vocabAxis: vocabAxis)
 
         var logProbs: [[Float]] = Array(
             repeating: Array(repeating: 0, count: vocabSize),
             count: timeSteps
         )
 
-        // Iterate over time/vocab dimensions, read logits or log-probabilities.
-        // Apply log-softmax per frame when needed.
+        // Apply log-softmax per frame.
         for t in 0..<timeSteps {
-            var logits = [Float](repeating: 0, count: vocabSize)
-
-            for v in 0..<vocabSize {
-                logits[v] = ctcOutput[indexBuilder(t, v)].floatValue
-            }
-
-            var row = logSoftmax(logits, temperature: temperature)
+            var row = logSoftmax(Array(logits[t * vocabSize..<(t + 1) * vocabSize]), temperature: temperature)
 
             // Apply blank bias: subtract from blank token log prob to penalize it
             if blankBias != 0.0 && blankId < row.count {
@@ -437,6 +425,74 @@ extension CtcKeywordSpotter {
         }
 
         return logProbs
+    }
+
+    /// Copy CTC logits into a frame-major `[timeSteps * vocabSize]` buffer with bulk pointer copies.
+    ///
+    /// Returns `nil` when the layout is not supported (unexpected data type, a non-singleton extra axis,
+    /// or neither the time nor the vocab axis having unit stride), so callers can fall back to
+    /// `frameMajorLogitsBySubscript`. Row padding (e.g. ANE-aligned strides) is handled.
+    static func frameMajorLogits(from array: MLMultiArray, timeAxis: Int, vocabAxis: Int) -> [Float]? {
+        let shape = array.shape.map { $0.intValue }
+        guard array.dataType == .float16 || array.dataType == .float32 else { return nil }
+        guard shape.indices.allSatisfy({ $0 == timeAxis || $0 == vocabAxis || shape[$0] == 1 }) else { return nil }
+
+        let timeSteps = shape[timeAxis]
+        let vocabSize = shape[vocabAxis]
+        let timeStride = array.strides[timeAxis].intValue
+        let vocabStride = array.strides[vocabAxis].intValue
+        return array.withUnsafeBytes { buffer -> [Float]? in
+            // Read rows along the unit-stride axis, then transpose if rows are vocab entries.
+            let rowsAreFrames = vocabStride == 1
+            guard rowsAreFrames || timeStride == 1 else { return nil }
+
+            let rows = rowsAreFrames ? timeSteps : vocabSize
+            let columns = rowsAreFrames ? vocabSize : timeSteps
+            let rowStride = rows == 1 ? columns : (rowsAreFrames ? timeStride : vocabStride)
+            guard rowStride >= columns else { return nil }
+
+            let elementSize = array.dataType == .float16 ? MemoryLayout<UInt16>.stride : MemoryLayout<Float>.stride
+            guard buffer.count >= ((rows - 1) * rowStride + columns) * elementSize, let base = buffer.baseAddress
+            else { return nil }
+
+            var dense = [Float](repeating: 0, count: rows * columns)
+            dense.withUnsafeMutableBufferPointer { destination in
+                if array.dataType == .float16 {
+                    var source = vImage_Buffer(
+                        data: UnsafeMutableRawPointer(mutating: base), height: vImagePixelCount(rows),
+                        width: vImagePixelCount(columns), rowBytes: rowStride * elementSize)
+                    var target = vImage_Buffer(
+                        data: destination.baseAddress, height: vImagePixelCount(rows),
+                        width: vImagePixelCount(columns), rowBytes: columns * MemoryLayout<Float>.stride)
+                    vImageConvert_Planar16FtoPlanarF(&source, &target, vImage_Flags(kvImageNoFlags))
+                } else {
+                    vDSP_mmov(
+                        base.assumingMemoryBound(to: Float.self), destination.baseAddress!,
+                        vDSP_Length(columns), vDSP_Length(rows), vDSP_Length(rowStride), vDSP_Length(columns))
+                }
+            }
+            guard !rowsAreFrames else { return dense }
+
+            var transposed = [Float](repeating: 0, count: rows * columns)
+            vDSP_mtrans(dense, 1, &transposed, 1, vDSP_Length(timeSteps), vDSP_Length(vocabSize))
+            return transposed
+        }
+    }
+
+    /// Stride-agnostic fallback for `frameMajorLogits` using `MLMultiArray` subscripts.
+    static func frameMajorLogitsBySubscript(from array: MLMultiArray, timeAxis: Int, vocabAxis: Int) -> [Float] {
+        let timeSteps = array.shape[timeAxis].intValue
+        let vocabSize = array.shape[vocabAxis].intValue
+        var index = [NSNumber](repeating: 0, count: array.shape.count)
+        var logits = [Float](repeating: 0, count: timeSteps * vocabSize)
+        for t in 0..<timeSteps {
+            index[timeAxis] = NSNumber(value: t)
+            for v in 0..<vocabSize {
+                index[vocabAxis] = NSNumber(value: v)
+                logits[t * vocabSize + v] = array[index].floatValue
+            }
+        }
+        return logits
     }
 
     private func logSoftmax(_ logits: [Float], temperature: Float = 1.0) -> [Float] {
