@@ -141,15 +141,17 @@ extension CtcModels {
     /// - Parameters:
     ///   - directory: Directory containing the downloaded CoreML bundles.
     ///   - variant: Which CTC model variant to load (default: .ctc110m).
+    ///   - computeUnits: Compute units for the models (default: `.cpuAndNeuralEngine`).
     /// - Returns: Loaded `CtcModels` instance.
     public static func load(
         from directory: URL,
-        variant: CtcModelVariant = .ctc110m
+        variant: CtcModelVariant = .ctc110m,
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine
     ) async throws -> CtcModels {
         logger.info("Loading CTC models (\(variant.displayName)) from: \(directory.path)")
 
         let parentDirectory = directory.deletingLastPathComponent()
-        let config = defaultConfiguration()
+        let config = MLModelConfigurationUtils.defaultConfiguration(computeUnits: computeUnits)
 
         // ModelHub expects the base directory (without the repo folder) and
         // resolves the repo's folderName internally.
