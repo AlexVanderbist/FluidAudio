@@ -9,13 +9,15 @@ What changed:
 - CTC logits are copied out of the model output in bulk (`vDSP` and `vImage`, including padded ANE strides) instead of one `MLMultiArray` subscript per value. Log-prob computation on the CPU path is about 13x faster, and vocabulary rescoring of 30 test recordings went from 25.4 s to 5.4 s (about 5x) with identical output.
 - Bug fix: the padding of the CTC audio input is now written as zeros. Upstream assumes `MLMultiArray` memory is zero-initialized, but it is not, so a reused allocation can leave old audio in the padding and make log-probs nondeterministic.
 - `CtcModels.load` has a `computeUnits:` parameter (default `.cpuAndNeuralEngine`, unchanged), so an app can load CPU copies first while the Neural Engine models compile.
-- 3 tests in `CtcInferenceBufferTests` check that the bulk copies match subscript access for Float16 and Float32, contiguous and padded layouts.
+- Bug fix: the CTC `MelSpectrogram` always runs on the CPU, like the Parakeet preprocessor; the compute units apply to the encoder only. On the Neural Engine the mel model returns near-zero features (98.8% zeros, seen on macOS 27.2 on an M1 Pro, also with upstream `762baf6`), so the encoder hears silence, blank wins every frame and keyword spotting and rescoring lose their acoustic evidence. `.cpuOnly`, `.cpuAndGPU` and `.all` return correct features.
+- 3 tests in `CtcInferenceBufferTests` check that the bulk copies match subscript access for Float16 and Float32, contiguous and padded layouts. `CtcModelsComputeUnitsTests` checks that a default load hears speech like a CPU-only load (skipped without cached CTC models).
 
 What to keep checking upstream:
 
 - Whether upstream fixed the uninitialized padding in `prepareAudioArray` (`CtcKeywordSpotter+Inference.swift`). If so, drop that part of the fork.
 - Changes to `CtcKeywordSpotter+Inference.swift` (`makeLogProbs`, `prepareAudioArray`), `CtcModels.swift` and the `CustomVocabulary` rescorer, which would conflict or change the output.
 - Model and version bumps: Parakeet TDT v2/v3, the CTC model variants (`CtcModelVariant`) and their output shapes.
+- Whether upstream pins the CTC `MelSpectrogram` to the CPU (`CtcModels.load` and `loadDirect`), or a new CTC model or macOS release makes the mel correct on the Neural Engine. Check with `CtcModelsComputeUnitsTests`, which fails when the default load hears silence.
 - CoreML loading API changes. If `CtcModels.load` gets a `configuration:` parameter like `AsrModels.load` has, use it and drop the fork's `computeUnits:`.
 
 To update, fetch upstream and rebase: `git fetch origin && git rebase origin/main`, then run `swift test`. If upstream merges equivalent changes, switch back to the upstream package.
