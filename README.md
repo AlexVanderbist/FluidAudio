@@ -1,5 +1,25 @@
 ![banner.png](banner.png)
 
+## About this fork
+
+This fork of [FluidInference/FluidAudio](https://github.com/FluidInference/FluidAudio) is used by a macOS dictation app for vocabulary boosting (CTC keyword spotting and rescoring of Parakeet output). The changes live on the `fast-ctc-inference` branch, based on upstream `762baf6733ca0f0dbeb1ce335363fc75066bd2c9`.
+
+What changed:
+
+- CTC logits are copied out of the model output in bulk (`vDSP` and `vImage`, including padded ANE strides) instead of one `MLMultiArray` subscript per value. Log-prob computation on the CPU path is about 13x faster, and vocabulary rescoring of 30 test recordings went from 25.4 s to 5.4 s (about 5x) with identical output.
+- Bug fix: the padding of the CTC audio input is now written as zeros. Upstream assumes `MLMultiArray` memory is zero-initialized, but it is not, so a reused allocation can leave old audio in the padding and make log-probs nondeterministic.
+- `CtcModels.load` has a `computeUnits:` parameter (default `.cpuAndNeuralEngine`, unchanged), so an app can load CPU copies first while the Neural Engine models compile.
+- 3 tests in `CtcInferenceBufferTests` check that the bulk copies match subscript access for Float16 and Float32, contiguous and padded layouts.
+
+What to keep checking upstream:
+
+- Whether upstream fixed the uninitialized padding in `prepareAudioArray` (`CtcKeywordSpotter+Inference.swift`). If so, drop that part of the fork.
+- Changes to `CtcKeywordSpotter+Inference.swift` (`makeLogProbs`, `prepareAudioArray`), `CtcModels.swift` and the `CustomVocabulary` rescorer, which would conflict or change the output.
+- Model and version bumps: Parakeet TDT v2/v3, the CTC model variants (`CtcModelVariant`) and their output shapes.
+- CoreML loading API changes. If `CtcModels.load` gets a `configuration:` parameter like `AsrModels.load` has, use it and drop the fork's `computeUnits:`.
+
+To update, fetch upstream and rebase: `git fetch origin && git rebase origin/main`, then run `swift test`. If upstream merges equivalent changes, switch back to the upstream package.
+
 # FluidAudio - Transcription, Text-to-speech, VAD, Speaker diarization with CoreML Models
 
 [![Swift](https://img.shields.io/badge/Swift-6.0+-orange.svg)](https://swift.org)
